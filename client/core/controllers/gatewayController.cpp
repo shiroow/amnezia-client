@@ -26,6 +26,10 @@ namespace
         constexpr char apiPayload[] = "api_payload";
         constexpr char keyPayload[] = "key_payload";
     }
+
+    constexpr QLatin1String errorResponsePattern1("No active configuration found for");
+    constexpr QLatin1String errorResponsePattern2("No non-revoked public key found for");
+    constexpr QLatin1String errorResponsePattern3("Account not found.");
 }
 
 GatewayController::GatewayController(const QString &gatewayEndpoint, bool isDevEnvironment, int requestTimeoutMsecs, QObject *parent)
@@ -194,16 +198,16 @@ QStringList GatewayController::getProxyUrls()
     QList<QSslError> sslErrors;
     QNetworkReply *reply;
 
-    QStringList proxyStorageUrl;
+    QStringList proxyStorageUrls;
     if (m_isDevEnvironment) {
-        proxyStorageUrl = QStringList { DEV_S3_ENDPOINT };
+        proxyStorageUrls = QString(DEV_S3_ENDPOINT).split(", ");
     } else {
-        proxyStorageUrl = QStringList { PROD_S3_ENDPOINT };
+        proxyStorageUrls = QString(PROD_S3_ENDPOINT).split(", ");
     }
 
     QByteArray key = m_isDevEnvironment ? DEV_AGW_PUBLIC_KEY : PROD_AGW_PUBLIC_KEY;
 
-    for (const auto &proxyStorageUrl : proxyStorageUrl) {
+    for (const auto &proxyStorageUrl : proxyStorageUrls) {
         request.setUrl(proxyStorageUrl);
         reply = amnApp->networkManager()->get(request);
 
@@ -247,6 +251,9 @@ QStringList GatewayController::getProxyUrls()
             }
             return endpoints;
         } else {
+            apiUtils::checkNetworkReplyErrors(sslErrors, reply);
+            qDebug() << "go to the next storage endpoint";
+
             reply->deleteLater();
         }
     }
@@ -257,17 +264,29 @@ bool GatewayController::shouldBypassProxy(QNetworkReply *reply, const QByteArray
                                           const QByteArray &iv, const QByteArray &salt)
 {
     if (reply->error() == QNetworkReply::NetworkError::OperationCanceledError || reply->error() == QNetworkReply::NetworkError::TimeoutError) {
-        qDebug() << "Timeout occurred";
+        qDebug() << "timeout occurred";
+        qDebug() << reply->error();
         return true;
     } else if (responseBody.contains("html")) {
-        qDebug() << "The response contains an html tag";
+        qDebug() << "the response contains an html tag";
         return true;
-    } else if (reply->error() == QNetworkReply::NetworkError::NoError && checkEncryption) {
+    } else if (reply->error() == QNetworkReply::NetworkError::ContentNotFoundError) {
+        if (responseBody.contains(errorResponsePattern1) || responseBody.contains(errorResponsePattern2)
+            || responseBody.contains(errorResponsePattern3)) {
+            return false;
+        } else {
+            qDebug() << reply->error();
+            return true;
+        }
+    } else if (reply->error() != QNetworkReply::NetworkError::NoError) {
+        qDebug() << reply->error();
+        return true;
+    } else if (checkEncryption) {
         try {
             QSimpleCrypto::QBlockCipher blockCipher;
             static_cast<void>(blockCipher.decryptAesBlockCipher(responseBody, key, iv, "", salt));
         } catch (...) {
-            qDebug() << "Failed to decrypt the data";
+            qDebug() << "failed to decrypt the data";
             return true;
         }
     }
@@ -288,7 +307,7 @@ void GatewayController::bypassProxy(const QString &endpoint, QNetworkReply *repl
     QByteArray responseBody;
 
     for (const QString &proxyUrl : proxyUrls) {
-        qDebug() << "Go to the next endpoint";
+        qDebug() << "go to the next proxy endpoint";
         reply->deleteLater(); // delete the previous reply
         reply = requestFunction(endpoint.arg(proxyUrl));
 
